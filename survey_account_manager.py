@@ -191,6 +191,7 @@ import tempfile
 import threading
 import time
 import urllib.parse
+import uuid
 import webbrowser
 
 try:
@@ -243,7 +244,7 @@ IS_MACOS: Final[bool] = sys.platform == "darwin"
 IS_LINUX: Final[bool] = sys.platform.startswith("linux")
 
 APP_TITLE: Final[str] = "مدير الحسابات"
-APP_VERSION: Final[str] = "6.5"
+APP_VERSION: Final[str] = "6.6"
 APP_AUTHOR: Final[str] = "Brian Finch"
 
 # All data files live next to this script so the app behaves identically no
@@ -334,6 +335,36 @@ UPDATE_PREF_KEY: Final[str] = "pref_auto_update_check"  # "1" = check on startup
 UPDATE_BACKUP_SUFFIX: Final[str] = ".bak"
 UPDATE_STAGE_FILENAME: Final[str] = "_update_download.py"
 UPDATE_USER_AGENT: Final[str] = f"AccountManager/{APP_VERSION} (self-update)"
+
+# ----------------------------------------------------------------------------
+# SUPABASE CLOUD SYNC (v6.6) — مزامنة سحابية اختيارية عبر Supabase
+#
+# كيف تُفعّلها (مرة واحدة):
+#   1) أنشئ مشروعًا مجانيًا على supabase.com ثم نفّذ ملف supabase_setup.sql
+#      من محرر SQL داخل لوحة المشروع (ينشئ الجدول + سياسات العزل RLS).
+#   2) أنشئ مستخدمًا لكل شخص من: Authentication → Users → Add user
+#      (فعّل Auto Confirm حتى يستطيع تسجيل الدخول فورًا).
+#   3) الصق قيم Project URL و anon key من: Settings → API في الثابتين أدناه.
+#   4) ارفع الملف إلى المستودع كأي تحديث. كل مستخدم يدخل بريده وكلمة المرور
+#      من داخل البرنامج: ملف → المزامنة السحابية.
+#
+# ⚠️ استخدم anon key فقط — لا تضع service_role key هنا أبدًا، فالعزل يعتمد
+#    على سياسات RLS التي تفرضها قاعدة البيانات نفسها على كل مستخدم.
+# ----------------------------------------------------------------------------
+SUPABASE_URL: Final[str] = "https://wqaqndarwisvpcuiuotp.supabase.co"            # مثال: https://xxxxxxxx.supabase.co
+SUPABASE_ANON_KEY: Final[str] = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6IndxYXFuZGFyd2lzdnBjdWl1b3RwIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTIwNzY4MTQsImV4cCI6MjEwNzY1MjgxNH0.PqghxICWruk9O1KU7aTaxqicqXr1yklECPTRP-cvvxo"       # مفتاح anon العام (آمن مع RLS)
+SYNC_TIMEOUT_SEC: Final[float] = 25.0
+SYNC_PAGE_SIZE: Final[int] = 500          # حجم صفحة السحب (PostgREST)
+SYNC_PUSH_CHUNK: Final[int] = 200         # حجم دفعة الرفع
+SYNC_RETRY_ATTEMPTS: Final[int] = 3
+SYNC_RETRY_DELAY_SEC: Final[float] = 2.0
+SYNC_TABLE: Final[str] = "accounts"
+SYNC_PREF_KEY: Final[str] = "pref_auto_sync"          # "1" = مزامنة عند الإقلاع
+SYNC_REFRESH_TOKEN_KEY: Final[str] = "sync_refresh_token"
+SYNC_USER_EMAIL_KEY: Final[str] = "sync_user_email"
+SYNC_USER_ID_KEY: Final[str] = "sync_user_id"
+SYNC_LAST_TIME_KEY: Final[str] = "sync_last_success"
+SYNC_USER_AGENT: Final[str] = f"AccountManager/{APP_VERSION} (cloud-sync)"
 
 
 
@@ -881,6 +912,297 @@ class Worker(QRunnable):
 _ACTIVE_WORKERS: set = set()
 
 
+# ============================================================================
+# SUPABASE CLOUD SYNC — PURE ENGINE (Qt-free, run_task-safe) — v6.6
+# ============================================================================
+# الفلسفة: قاعدة SQLite المحلية هي المصدر الدائم ولا يتوقف البرنامج عن العمل
+# بدون إنترنت. السحابة نسخة مزامنة تُحدَّث عند كل إقلاع (ومن النافذة يدويًا).
+# كل صف يحمل هوية فريدة (sync_id) وطابعًا زمنيًا (updated_at)؛ الأحدث زمنيًا
+# يفوز عند التعارض (last-write-wins)، والحذف ناعم (tombstone) حتى لا يمسح جهاز
+# بيانات جهاز آخر، ولا يمكن أن تتكرر الصفوف بفضل الهوية الفريدة.
+SYNC_DATA_COLUMNS: Final[Tuple[str, ...]] = (
+    "number", "name", "dob", "email", "password", "notes", "referrals",
+    "street", "city_town", "state_province_region", "zip_postal_code",
+    "points", "is_active", "points_last_modified", "category",
+)
+
+
+def _utc_now_iso() -> str:
+    """UTC timestamp in a fixed-width ISO format, so comparing two strings
+    with '<'/'>' is exactly comparing the two moments in time."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
+def _new_sync_id() -> str:
+    """هوية UUIDv4 جديدة — تعرّف صف الحساب عبر كل الأجهزة دون تكرار."""
+    return str(uuid.uuid4())
+
+
+def _format_sync_time(iso_utc: str) -> str:
+    """حوّل طابع UTC المخزّن إلى عرض محلي مألوف (مثال: 2026-10-16 14:30)."""
+    try:
+        dt = datetime.strptime(iso_utc.strip(), "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=timezone.utc)
+        return dt.astimezone().strftime("%Y-%m-%d %H:%M")
+    except (ValueError, TypeError):
+        return iso_utc
+
+
+def _sync_configured() -> bool:
+    return bool(SUPABASE_URL.strip() and SUPABASE_ANON_KEY.strip())
+
+
+class SyncError(Exception):
+    """خطأ مزامنة برسالة عربية جاهزة للعرض للمستخدم."""
+
+
+class SyncAuthError(SyncError):
+    """انتهت الجلسة أو بيانات الدخول غير صحيحة — يلزم تسجيل دخول جديد."""
+
+
+def _classify_http_error(status: int, body: str) -> SyncError:
+    """حوّل استجابة خطأ من Supabase إلى رسالة عربية قابلة للتنفيذ."""
+    # ملاحظة: فشل كلمة مرور الدخول يعيد أيضًا error=invalid_grant، لذا فحص
+    # بيانات الدخول الخاطئة يجب أن يسبق فحص انتهاء الجلسة.
+    if status == 400 and "Invalid login credentials" in body:
+        return SyncAuthError("البريد الإلكتروني أو كلمة المرور غير صحيحة.")
+    if status == 400 and ("invalid_grant" in body or "Invalid Refresh Token" in body
+                          or "expired" in body.lower()):
+        return SyncAuthError(
+            "انتهت صلاحية الجلسة المحفوظة. سجّل الدخول من جديد من نافذة المزامنة السحابية.")
+    if status == 401:
+        return SyncAuthError("انتهت صلاحية الجلسة (401). سجّل الدخول من جديد.")
+    if status in (502, 503, 504, 540):
+        return SyncError(
+            "المشروع السحابي متوقف مؤقتًا — الخطة المجانية تتوقف بعد أسبوع من عدم "
+            "الاستخدام ولا تضيع البيانات.\nافتح لوحة supabase.com واضغط Restore على "
+            "المشروع ثم أعد المحاولة. يعمل البرنامج محليًا بشكل طبيعي في هذه الأثناء.")
+    if status == 42501 or "row-level security" in body.lower():
+        return SyncError(
+            "رفضت قاعدة البيانات العملية بسبب سياسات العزل (RLS) — تأكد أن هذا "
+            "الحساب مالك هذه الصفوف وأنك نفّذت supabase_setup.sql كاملًا.")
+    return SyncError(f"خطأ من الخادم السحابي (HTTP {status}): {body[:180]}")
+
+
+def _sync_request(method: str, url: str, *, token: Optional[str] = None,
+                  payload: Optional[Any] = None, params: Optional[Dict[str, str]] = None,
+                  prefer: Optional[str] = None) -> httpx.Response:
+    """طلب HTTP واحد إلى Supabase مع إعادة محاولة تلقائية للأخطاء العابرة.
+
+    الأخطاء الشبكية (انقطاع/مهلة) وأخطاء الخادم 5xx يعاد تجربتها مع تأخير
+    متزايد؛ أخطاء المصادقة والإعداد ترتفع فورًا برسالة عربية واضحة.
+    """
+    headers = {"apikey": SUPABASE_ANON_KEY, "User-Agent": SYNC_USER_AGENT,
+               "Content-Type": "application/json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    if prefer:
+        headers["Prefer"] = prefer
+    last_desc = ""
+    for attempt in range(1, SYNC_RETRY_ATTEMPTS + 1):
+        network_error: Optional[str] = None
+        try:
+            resp = httpx.request(method, url, json=payload, params=params,
+                                 headers=headers, timeout=SYNC_TIMEOUT_SEC)
+        except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+            network_error = "لا يوجد اتصال بالإنترنت (أو تعذّر الوصول إلى الخادم السحابي)"
+        except httpx.HTTPError as exc:
+            network_error = f"خطأ شبكة: {exc}"
+        if network_error is None:
+            if resp.status_code < 400:
+                return resp
+            try:
+                data = resp.json()
+            except Exception:
+                data = {}
+            code = str(data.get("error") or data.get("code") or "")
+            detail = str(data.get("msg") or data.get("message")
+                         or data.get("error_description") or resp.text)
+            body = f"{code} {detail}".strip()
+            err = _classify_http_error(resp.status_code, body)
+            if resp.status_code >= 500 and attempt < SYNC_RETRY_ATTEMPTS:
+                last_desc = str(err)
+                time.sleep(SYNC_RETRY_DELAY_SEC * attempt)
+                continue
+            raise err
+        if attempt < SYNC_RETRY_ATTEMPTS:
+            last_desc = network_error
+            time.sleep(SYNC_RETRY_DELAY_SEC * attempt)
+            continue
+        raise SyncError(
+            f"{network_error} — بعد {SYNC_RETRY_ATTEMPTS} محاولات. "
+            "النسخة المحلية تعمل بشكل طبيعي وستتم المزامنة تلقائيًا عند توفر الإنترنت.")
+    raise SyncError(f"{last_desc or 'تعذّر الاتصال'} — تعذّر إكمال العملية السحابية.")
+
+
+def _session_from_response(resp: httpx.Response) -> Dict[str, Any]:
+    try:
+        data = resp.json()
+    except Exception as exc:
+        raise SyncError("استجابة غير صالحة من خادم المصادقة.") from exc
+    access = str(data.get("access_token") or "").strip()
+    refresh = str(data.get("refresh_token") or "").strip()
+    user = data.get("user") or {}
+    user_id = str(user.get("id") or "").strip()
+    email = str(user.get("email") or "").strip()
+    if not access or not refresh or not user_id:
+        raise SyncError("استجابة مصادقة ناقصة من الخادم (توكن أو معرّف مستخدم مفقود).")
+    return {"access_token": access, "refresh_token": refresh,
+            "user_id": user_id, "email": email}
+
+
+def sync_sign_in(email: str, password: str) -> Dict[str, Any]:
+    """تسجيل الدخول إلى Supabase Auth (بريد + كلمة مرور لكل مستخدم)."""
+    if not _sync_configured():
+        raise SyncError(
+            "المزامنة غير مُعدّة في هذه النسخة: ثابتا SUPABASE_URL و SUPABASE_ANON_KEY "
+            "فارغان. الشرح موجود في التعليقات أعلى ملف البرنامج.")
+    email = (email or "").strip()
+    if not email or not password:
+        raise SyncError("أدخل البريد الإلكتروني وكلمة المرور أولًا.")
+    resp = _sync_request(
+        "POST", f"{SUPABASE_URL}/auth/v1/token",
+        params={"grant_type": "password"},
+        payload={"email": email, "password": password,
+                 "gotrue_meta_security": {"captcha_token": None}})
+    return _session_from_response(resp)
+
+
+def sync_refresh_session(refresh_token: str) -> Dict[str, Any]:
+    """تجديد الجلسة المحفوظة (يدور refresh_token عند كل تجديد)."""
+    if not _sync_configured():
+        raise SyncError(
+            "المزامنة غير مُعدّة في هذه النسخة: ثابتا SUPABASE_URL و SUPABASE_ANON_KEY فارغان.")
+    resp = _sync_request(
+        "POST", f"{SUPABASE_URL}/auth/v1/token",
+        params={"grant_type": "refresh_token"},
+        payload={"refresh_token": refresh_token})
+    return _session_from_response(resp)
+
+
+def sync_pull_rows(access_token: str) -> List[Dict[str, Any]]:
+    """اسحب كل صفوف المستخدم الحالي من Supabase (PostgREST) بترقيم صفحات تلقائي."""
+    rows: List[Dict[str, Any]] = []
+    offset = 0
+    url = f"{SUPABASE_URL}/rest/v1/{SYNC_TABLE}"
+    while True:
+        resp = _sync_request("GET", url, token=access_token,
+                             params={"select": "*", "limit": str(SYNC_PAGE_SIZE),
+                                     "offset": str(offset)})
+        try:
+            page = resp.json()
+        except Exception as exc:
+            raise SyncError("استجابة غير صالحة أثناء سحب البيانات من السحابة.") from exc
+        if not isinstance(page, list):
+            raise SyncError("استجابة غير متوقعة أثناء سحب البيانات من السحابة.")
+        rows.extend(page)
+        if len(page) < SYNC_PAGE_SIZE:
+            return rows
+        offset += SYNC_PAGE_SIZE
+
+
+def cloud_payload_from_local(row: Dict[str, Any], user_id: str) -> Dict[str, Any]:
+    """حوّل صف SQLite محلي إلى صف JSON بصيغة جدول Supabase."""
+    payload: Dict[str, Any] = {
+        "id": row.get("sync_id"),
+        "user_id": user_id,
+        "deleted": bool(row.get("deleted")),
+        "updated_at": row.get("updated_at") or _utc_now_iso(),
+    }
+    for col in SYNC_DATA_COLUMNS:
+        val = row.get(col)
+        if col == "is_active":
+            payload[col] = int(bool(val)) if val is not None else 1
+        else:
+            payload[col] = val
+    return payload
+
+
+def sync_push_rows(access_token: str, user_id: str,
+                   local_rows: List[Dict[str, Any]]) -> int:
+    """ارفع/حدّث الصفوف المحلية في السحابة (upsert دفعات على المفتاح id)."""
+    if not local_rows:
+        return 0
+    pushed = 0
+    url = f"{SUPABASE_URL}/rest/v1/{SYNC_TABLE}?on_conflict=id"
+    for start in range(0, len(local_rows), SYNC_PUSH_CHUNK):
+        chunk = [cloud_payload_from_local(r, user_id)
+                 for r in local_rows[start:start + SYNC_PUSH_CHUNK]]
+        _sync_request("POST", url, token=access_token, payload=chunk,
+                      prefer="resolution=merge-duplicates,return=minimal")
+        pushed += len(chunk)
+    return pushed
+
+
+def plan_sync_merge(local_rows: List[Dict[str, Any]],
+                    cloud_rows: List[Dict[str, Any]]
+                    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """خطة الدمج ثنائي الاتجاه — القلب القابل للاختبار في المزامنة.
+
+    يعيد (to_apply_local, to_push):
+      • صف محلي فقط  → يُرفع للسحابة (حتى لو حذف ناعم لنشر إزالته).
+      • صف سحابي فقط → يُطبّق محليًا (ما لم يكن حذفًا لصف لا يوجد محليًا أصلًا).
+      • صف في المكانين → الأحدث updated_at يفوز؛ عند التساوي يبقى الوضع المحلي.
+    """
+    local_by_sid = {str(r.get("sync_id") or ""): r
+                    for r in local_rows if r.get("sync_id")}
+    cloud_by_sid = {str(r.get("id") or ""): r
+                    for r in cloud_rows if r.get("id")}
+    to_apply: List[Dict[str, Any]] = []
+    to_push: List[Dict[str, Any]] = []
+    for sid, cloud in cloud_by_sid.items():
+        local = local_by_sid.get(sid)
+        if local is None:
+            if not cloud.get("deleted"):
+                to_apply.append(cloud)
+            continue
+        cloud_ts = str(cloud.get("updated_at") or "")
+        local_ts = str(local.get("updated_at") or "")
+        if cloud_ts > local_ts:
+            to_apply.append(cloud)
+        elif local_ts > cloud_ts:
+            to_push.append(local)
+    for sid, local in local_by_sid.items():
+        if sid not in cloud_by_sid:
+            to_push.append(local)
+    return to_apply, to_push
+
+
+def run_cloud_sync(db: Any, refresh_token: str,
+                   session: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """المزامنة الكاملة: جلسة → سحب → دمج → تطبيق محليًا → رفع.
+
+    تعمل داخل خيط خلفية (run_task) بلا أي شيء من Qt. الوسيط db هو مدير
+    قاعدة البيانات المحلية؛ SQLite يبقى المصدر الدائم للبيانات.
+    عند نجاح الخطوات يُعاد ملخّص + refresh_token الجديد (يدور عند كل تجديد).
+    """
+    if not _sync_configured():
+        raise SyncError(
+            "المزامنة غير مُعدّة: ضع Project URL و anon key في ثوابت SUPABASE "
+            "أعلى ملف البرنامج (الشرح فوقها مباشرة).")
+    if session is None:
+        if not refresh_token:
+            raise SyncAuthError(
+                "لا توجد جلسة محفوظة. سجّل الدخول من نافذة المزامنة السحابية: "
+                "ملف → ☁️ المزامنة السحابية.")
+        session = sync_refresh_session(refresh_token)
+    user_id = session["user_id"]
+    cloud_rows = sync_pull_rows(session["access_token"])
+    local_rows = db.get_accounts_for_sync()
+    to_apply, to_push = plan_sync_merge(local_rows, cloud_rows)
+    applied, skipped = db.apply_cloud_account_rows(to_apply)
+    pushed = sync_push_rows(session["access_token"], user_id, to_push)
+    return {
+        "pulled": len(cloud_rows),
+        "applied_local": applied,
+        "skipped_local": skipped,
+        "pushed": pushed,
+        "refresh_token": session["refresh_token"],
+        "user_id": user_id,
+        "email": session.get("email", ""),
+        "finished_at": _utc_now_iso(),
+    }
+
+
 def run_task(fn, on_done=None, on_error=None, *args,
              busy_button: Optional[QPushButton] = None,
              status_bar: Optional[QStatusBar] = None,
@@ -1011,6 +1333,28 @@ class DatabaseManager:
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_accounts_active_cat ON accounts(is_active, category)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_point_history_account ON point_history(account_id, changed_at DESC)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_point_history_changed ON point_history(changed_at DESC)")
+        # --- v6.6 cloud-sync migration: أعمدة المزامنة + هوية فريدة لكل صف ---
+        # تعمل بأمان على قواعد بيانات قديمة (تضيف الأعمدة إن لم تكن موجودة) وتمنح
+        # كل صف موجود هوية sync_id وطابع updated_at حتى تُدمج جميع الأجهزة لاحقًا.
+        acct_cols = {row[1] for row in cursor.execute("PRAGMA table_info(accounts)").fetchall()}
+        if "sync_id" not in acct_cols:
+            cursor.execute("ALTER TABLE accounts ADD COLUMN sync_id TEXT")
+        if "updated_at" not in acct_cols:
+            cursor.execute("ALTER TABLE accounts ADD COLUMN updated_at TEXT")
+        if "deleted" not in acct_cols:
+            cursor.execute("ALTER TABLE accounts ADD COLUMN deleted INTEGER DEFAULT 0")
+        cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_accounts_sync_id ON accounts(sync_id)")
+        cursor.execute(
+            """UPDATE accounts SET sync_id = lower(
+                    hex(randomblob(4)) || '-' || hex(randomblob(2)) || '-4' ||
+                    substr(hex(randomblob(2)), 2) || '-' ||
+                    substr('89ab', abs(random()) % 4 + 1, 1) || substr(hex(randomblob(2)), 2) ||
+                    '-' || hex(randomblob(6)))
+                WHERE sync_id IS NULL OR sync_id = ''""")
+        cursor.execute(
+            "UPDATE accounts SET updated_at = ? WHERE updated_at IS NULL OR updated_at = ''",
+            (_utc_now_iso(),))
+        cursor.execute("UPDATE accounts SET deleted = 0 WHERE deleted IS NULL")
         for cat in PREDEFINED_CATEGORIES:
             cursor.execute("INSERT OR IGNORE INTO categories (name) VALUES (?)", (cat,))
         # Retire the legacy "غير معروف" category: accounts that still use it (or that have no
@@ -1100,12 +1444,14 @@ class DatabaseManager:
             self._exec(
                 """INSERT INTO accounts (number, name, dob, email, password, notes, referrals,
                     street, city_town, state_province_region, zip_postal_code, points,
-                    is_active, points_last_modified, category)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    is_active, points_last_modified, category,
+                    sync_id, updated_at, deleted)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, ?,?,0)""",
                 (d["number"], d["name"], d["dob"], d["email"], d["password"],
                  d["notes"], d["referrals"], d["street"], d["city_town"],
                  d["state_province_region"], d["zip_postal_code"], d["points"],
-                 d["is_active"], d["points_last_modified"], d["category"]),
+                 d["is_active"], d["points_last_modified"], d["category"],
+                 _new_sync_id(), _utc_now_iso()),
             )
             new_id = self._conn.last_insert_rowid()
         logger.info("Added account: {} (id={})", d["name"], new_id)
@@ -1114,7 +1460,8 @@ class DatabaseManager:
     def _account_where(self, is_active: Optional[int] = None,
                        categories: Optional[List[str]] = None,
                        search: Optional[str] = None) -> Tuple[str, Tuple]:
-        clauses: List[str] = []
+        # الصفوف المحذوفة ناعمًا (شواهد المزامنة) مخفية دائمًا عن كل واجهات العرض
+        clauses: List[str] = ["deleted=0"]
         params: List[Any] = []
         if is_active is not None:
             clauses.append("is_active=?")
@@ -1167,14 +1514,15 @@ class DatabaseManager:
         return result
 
     def get_account_names(self) -> List[Tuple[int, str]]:
-        rows = list(self._exec("SELECT id, name FROM accounts ORDER BY name ASC"))
+        rows = list(self._exec(
+            "SELECT id, name FROM accounts WHERE deleted=0 ORDER BY name ASC"))
         return [(int(r[0]), r[1] or "") for r in rows]
 
     def get_account_counts(self) -> Tuple[int, int, int]:
         rows = list(self._exec(
             "SELECT COUNT(*), "
             "SUM(CASE WHEN is_active=1 THEN 1 ELSE 0 END), "
-            "SUM(CASE WHEN is_active=0 THEN 1 ELSE 0 END) FROM accounts"
+            "SUM(CASE WHEN is_active=0 THEN 1 ELSE 0 END) FROM accounts WHERE deleted=0"
         ))
         total, active, inactive = rows[0] if rows else (0, 0, 0)
         return int(total or 0), int(active or 0), int(inactive or 0)
@@ -1252,19 +1600,27 @@ class DatabaseManager:
             """UPDATE accounts SET number=?, name=?, dob=?, email=?, password=?,
                 notes=?, street=?, city_town=?, state_province_region=?,
                 zip_postal_code=?, points=?, is_active=?, referrals=?,
-                points_last_modified=?, category=? WHERE id=?""",
+                points_last_modified=?, category=?, updated_at=? WHERE id=?""",
             (data.get("number"), data.get("name"), data.get("dob"), data.get("email"),
              data.get("password"), data.get("notes"), data.get("street"),
              data.get("city_town"), data.get("state_province_region"),
              data.get("zip_postal_code"), data.get("points"), data.get("is_active"),
              data.get("referrals"), data.get("points_last_modified"),
-             data.get("category"), account_id),
+             data.get("category"), _utc_now_iso(), account_id),
         )
         logger.info("Updated account id={}", account_id)
 
     def delete_account(self, account_id: int) -> None:
-        self._exec("DELETE FROM accounts WHERE id=?", (account_id,))
-        logger.info("Deleted account id={}", account_id)
+        """حذف ناعم: يبقى السجل كشاهد مزامنة (tombstone) حتى تُنشر إزالته
+        للأجهزة الأخرى ولا يعود أحد منهم لإحياء الصف المحذوف، مع تحرير رقم
+        الحساب (قيد UNIQUE) لصالح الحسابات الجديدة."""
+        self._exec(
+            """UPDATE accounts SET deleted=1, updated_at=?,
+                number = COALESCE(number, '') || ' ⟵حذف ' || substr(COALESCE(sync_id, '-'), 1, 6)
+                WHERE id=?""",
+            (_utc_now_iso(), account_id),
+        )
+        logger.info("Soft-deleted account id={}", account_id)
 
     def get_next_account_id(self) -> int:
         rows = list(self._exec("SELECT seq FROM sqlite_sequence WHERE name='accounts'"))
@@ -1275,11 +1631,68 @@ class DatabaseManager:
             return 0
         placeholders = ",".join("?" * len(account_ids))
         with self._lock:  # UPDATE + changes() must be atomic
-            self._exec(f"UPDATE accounts SET category=? WHERE id IN ({placeholders})", (new_category, *account_ids))
+            self._exec(
+                f"UPDATE accounts SET category=?, updated_at=? WHERE id IN ({placeholders}) AND deleted=0",
+                (new_category, _utc_now_iso(), *account_ids))
             return self._conn.changes()
 
+    def get_accounts_for_sync(self) -> List[Dict[str, Any]]:
+        """كل الصفوف (بما فيها المحذوفة ناعمًا) ببياناتها الكاملة لأجل المزامنة."""
+        cols = list(self._COLUMN_NAMES) + ["sync_id", "updated_at", "deleted"]
+        rows = list(self._exec(f"SELECT {', '.join(cols)} FROM accounts ORDER BY id ASC"))
+        result = []
+        for row in rows:
+            d = dict(zip(cols, row))
+            d["deleted"] = int(d.get("deleted") or 0)
+            result.append(d)
+        return result
+
+    def apply_cloud_account_rows(self, cloud_rows: List[Dict[str, Any]]) -> Tuple[int, int]:
+        """طبّق صفوف السحابة على SQLite (upsert على sync_id — بلا تكرار أبدًا).
+
+        عند تعارض رقم الحساب الفريد (أُنشئ الحساب نفسه على جهازين مختلفين
+        أثناء انقطاع الشبكة) يُميَّز الرقم بلصقة قصيرة ويُعاد الإدخال، فلا
+        يضيع أي بيان ولا يفشل القسم كله. يعيد (المُطبّق، المُتجاهَل).
+        """
+        cols = list(SYNC_DATA_COLUMNS) + ["sync_id", "updated_at", "deleted"]
+        placeholders = ",".join("?" * len(cols))
+        update_set = ", ".join(f"{c}=excluded.{c}" for c in cols if c != "sync_id")
+        sql = (f"INSERT INTO accounts ({', '.join(cols)}) VALUES ({placeholders}) "
+               f"ON CONFLICT(sync_id) DO UPDATE SET {update_set}")
+        applied = 0
+        skipped = 0
+        for raw in cloud_rows:
+            row = dict(raw)
+            sid = str(row.get("id") or "").strip()
+            if not sid:
+                skipped += 1
+                continue
+            row["sync_id"] = sid
+            row["deleted"] = 1 if row.get("deleted") else 0
+            row["is_active"] = int(bool(row.get("is_active")))
+            row["points"] = str(row.get("points") or "0")
+            if not str(row.get("updated_at") or ""):
+                row["updated_at"] = _utc_now_iso()
+            try:
+                with self._lock:
+                    self._exec(sql, tuple(row.get(c) for c in cols))
+                applied += 1
+            except Exception as exc:
+                retry_row = dict(row)
+                retry_row["number"] = f"{row.get('number') or ''} ~{sid[:4]}"
+                try:
+                    with self._lock:
+                        self._exec(sql, tuple(retry_row.get(c) for c in cols))
+                    applied += 1
+                    logger.warning("Sync apply: number conflict for {} resolved with suffix", sid)
+                except Exception:
+                    logger.warning("Sync apply skipped for {}: {}", sid, exc)
+                    skipped += 1
+        return applied, skipped
+
     def get_category_counts(self) -> Dict[str, int]:
-        rows = list(self._exec("SELECT category, COUNT(*) FROM accounts GROUP BY category"))
+        rows = list(self._exec(
+            "SELECT category, COUNT(*) FROM accounts WHERE deleted=0 GROUP BY category"))
         return {r[0]: r[1] for r in rows}
 
     def save_proxy_config(self, ip: str, port: str, username: str, password: str, config_json: str) -> int:
@@ -2117,6 +2530,165 @@ class UpdateAvailableDialog(QDialog):
             self.setWindowTitle("تحديث إجباري مطلوب")
 
 
+class CloudSyncDialog(QDialog):
+    """نافذة المزامنة السحابية (Supabase) — v6.6.
+
+    تعرض حالة الاتصال (مسجل باسم من / غير مسجل)، وآخر مزامنة ناجحة، وتتيح
+    تسجيل الدخول، المزامنة الفورية، وتسجيل الخروج. كل العمليات الشبكية
+    تعمل في خيط الخلفية عبر دوال النافذة الرئيسية (run_task) فلا يتجمد
+    الواجهة أبدًا، ورسائل الأخطاء عربية قابلة للتنفيذ.
+    """
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("المزامنة السحابية — Supabase")
+        self.setLayoutDirection(Qt.RightToLeft)
+        self.setMinimumWidth(520)
+        self.setModal(True)
+
+        layout = QVBoxLayout(self)
+        layout.setSpacing(12)
+
+        self.header_label = QLabel()
+        self.header_label.setTextFormat(Qt.RichText)
+        self.header_label.setWordWrap(True)
+        self.header_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        layout.addWidget(self.header_label)
+
+        # شرح التفعيل (يظهر فقط عندما تكون ثوابت SUPABASE فارغة)
+        self.setup_label = QLabel(
+            "المزامنة غير مُفعّلة في هذه النسخة بعد. خطوات التفعيل (للمشرف، مرة واحدة):\n\n"
+            "1) أنشئ مشروعًا مجانيًا على supabase.com\n"
+            "2) نفّذ ملف supabase_setup.sql المرفق من محرر SQL داخل لوحة المشروع\n"
+            "3) أنشئ مستخدمًا لكل شخص من Authentication ← Users ← Add user "
+            "(مع تفعيل Auto Confirm)\n"
+            "4) انسخ Project URL و anon key إلى الثابتين SUPABASE_URL و "
+            "SUPABASE_ANON_KEY أعلى ملف البرنامج ثم أعد توزيعه كتحديث\n\n"
+            "بعد التفعيل يكفي أن يسجّل كل مستخدم بريده وكلمة مروره هنا، وتعمل "
+            "المزامنة تلقائيًا عند كل إقلاع. كل مستخدم يرى بياناته هو فقط "
+            "(عزل مفرض من قاعدة البيانات نفسها عبر RLS).")
+        self.setup_label.setWordWrap(True)
+        self.setup_label.setVisible(False)
+        layout.addWidget(self.setup_label)
+
+        # نموذج تسجيل الدخول
+        self.login_box = QGroupBox("تسجيل الدخول")
+        self.login_box.setLayoutDirection(Qt.RightToLeft)
+        form = QGridLayout(self.login_box)
+        form.setLayoutDirection(Qt.RightToLeft)
+        self.email_input = QLineEdit()
+        self.email_input.setPlaceholderText("البريد الإلكتروني للحساب السحابي")
+        self.password_input = QLineEdit()
+        self.password_input.setPlaceholderText("كلمة المرور")
+        self.password_input.setEchoMode(QLineEdit.Password)
+        form.addWidget(QLabel("البريد:"), 0, 0)
+        form.addWidget(self.email_input, 0, 1)
+        form.addWidget(QLabel("كلمة المرور:"), 1, 0)
+        form.addWidget(self.password_input, 1, 1)
+        layout.addWidget(self.login_box)
+
+        self.status_label = QLabel()
+        self.status_label.setWordWrap(True)
+        self.status_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        layout.addWidget(self.status_label)
+
+        buttons = QHBoxLayout()
+        self.login_button = QPushButton("🔐 تسجيل الدخول والمزامنة")
+        self.login_button.setObjectName("primaryButton")
+        self.login_button.clicked.connect(self._on_login)
+        self.sync_button = QPushButton("🔄 مزامنة الآن")
+        self.sync_button.setObjectName("primaryButton")
+        self.sync_button.clicked.connect(self._on_sync_now)
+        self.logout_button = QPushButton("🚪 تسجيل الخروج")
+        self.logout_button.clicked.connect(self._on_logout)
+        self.close_button = QPushButton("إغلاق")
+        self.close_button.clicked.connect(self.accept)
+        buttons.addWidget(self.login_button)
+        buttons.addWidget(self.sync_button)
+        buttons.addWidget(self.logout_button)
+        buttons.addStretch(1)
+        buttons.addWidget(self.close_button)
+        layout.addLayout(buttons)
+
+        self.refresh_state()
+
+    # ---------------------------- الحالة ----------------------------
+    def _parent_window(self):
+        return self.parent() if self.parent() is not None else None
+
+    def _saved_email(self) -> str:
+        parent = self._parent_window()
+        db = getattr(parent, "db_manager", None) if parent is not None else None
+        if db is None:
+            return ""
+        return str(db.get_setting(SYNC_USER_EMAIL_KEY, "") or "")
+
+    def refresh_state(self) -> None:
+        """أعد بناء العرض وفق الوضع الحالي (غير مُعدّة / غير مسجل / مسجل)."""
+        parent = self._parent_window()
+        db = getattr(parent, "db_manager", None) if parent is not None else None
+        configured = _sync_configured()
+        email = self._saved_email()
+        self.setup_label.setVisible(not configured)
+        self.login_box.setVisible(configured and not email)
+        self.login_button.setVisible(configured and not email)
+        self.sync_button.setVisible(configured and bool(email))
+        self.logout_button.setVisible(configured and bool(email))
+        if not configured:
+            self.header_label.setText(
+                f"<h2 style='margin:0;'>☁️ المزامنة السحابية</h2>"
+                f"<p style='margin:6px 0 0 0;'>الحالة: <b>غير مُفعّلة في هذه النسخة</b></p>")
+            self.status_label.setText("")
+            return
+        if email:
+            last = ""
+            if db is not None:
+                last = str(db.get_setting(SYNC_LAST_TIME_KEY, "") or "")
+            last_display = _format_sync_time(last) if last else "لم تتم بعد"
+            self.header_label.setText(
+                f"<h2 style='margin:0;'>☁️ المزامنة السحابية</h2>"
+                f"<p style='margin:6px 0 0 0;'>متصل باسم: <b>{email}</b><br>"
+                f"آخر مزامنة ناجحة: <b>{last_display}</b></p>")
+        else:
+            self.header_label.setText(
+                f"<h2 style='margin:0;'>☁️ المزامنة السحابية</h2>"
+                f"<p style='margin:6px 0 0 0;'>الحالة: <b>غير مسجل</b> — "
+                f"أدخل بيانات حسابك السحابي لتفعيل المزامنة على هذا الجهاز.</p>")
+        if not self.status_label.text():
+            self.status_label.setText(
+                "البيانات المحلية تبقى المصدر الدائم؛ يعمل البرنامج بشكل كامل "
+                "بدون إنترنت وتُرفع التغييرات تلقائيًا عند توفر الاتصال.")
+
+    def set_status(self, text: str) -> None:
+        self.status_label.setText(text)
+
+    def set_busy(self, busy: bool, message: str = "") -> None:
+        self.login_button.setEnabled(not busy)
+        self.sync_button.setEnabled(not busy)
+        self.logout_button.setEnabled(not busy)
+        if message:
+            self.set_status(message)
+
+    # ---------------------------- الأزرار ----------------------------
+    def _on_login(self) -> None:
+        parent = self._parent_window()
+        handler = getattr(parent, "_do_cloud_login", None)
+        if callable(handler):
+            handler(self, self.email_input.text(), self.password_input.text())
+
+    def _on_sync_now(self) -> None:
+        parent = self._parent_window()
+        handler = getattr(parent, "_run_cloud_sync", None)
+        if callable(handler):
+            handler(dialog=self, manual=True)
+
+    def _on_logout(self) -> None:
+        parent = self._parent_window()
+        handler = getattr(parent, "_cloud_logout", None)
+        if callable(handler):
+            handler(self)
+
+
 class PreferencesDialog(QDialog):
     def __init__(self, font_manager: FontManager, density: int = UI_DENSITY_DEFAULT,
                  alert_sound: str = DEFAULT_ALERT_SOUND,
@@ -2243,6 +2815,9 @@ class MainWindow(QMainWindow):
         self.proxy_original_values: Dict[str, str] = {}
         self._update_check_in_flight: bool = False   # update-checker guard
         self._auto_update_pref: bool = True          # refined right below
+        self._sync_in_flight: bool = False           # cloud-sync reentry guard
+        self._sync_dialog_ref = None                 # live CloudSyncDialog (if open)
+        self._auto_sync_pref: bool = True            # refined right below
 
         # Async-operation state (see run_task / Worker helpers above)
         self._firefox_check_in_flight: bool = False
@@ -2301,6 +2876,11 @@ class MainWindow(QMainWindow):
         # exists; the manual path is ملف → التحقق من التحديثات.
         self._auto_update_pref = self._load_auto_update_pref()
         QTimer.singleShot(3500, lambda: self._check_for_updates(manual=False))
+
+        # المزامنة السحابية: سحب/رفع صامت بعد نافذة فحص التحديث، فقط إن وُجدت
+        # جلسة محفوظة وضُبطت ثوابت SUPABASE؛ وإلا فلا شيء يحدث إطلاقًا.
+        self._auto_sync_pref = self._load_auto_sync_pref()
+        QTimer.singleShot(6500, self._auto_cloud_sync)
 
         logger.info("MainWindow init complete (admin disabled, all tabs visible)")
 
@@ -3097,6 +3677,18 @@ class MainWindow(QMainWindow):
         auto_upd.setChecked(self._auto_update_pref)
         auto_upd.toggled.connect(self._set_auto_update_pref)
         file_menu.addAction(auto_upd)
+
+        file_menu.addSeparator()
+        cloud_sync = QAction("☁️ المزامنة السحابية...", self)
+        cloud_sync.setStatusTip("تسجيل الدخول ومزامنة الحسابات مع قاعدة Supabase السحابية")
+        cloud_sync.triggered.connect(self._open_cloud_sync_dialog)
+        file_menu.addAction(cloud_sync)
+
+        auto_sync = QAction("☁️ مزامنة عند بدء التشغيل", self)
+        auto_sync.setCheckable(True)
+        auto_sync.setChecked(self._auto_sync_pref)
+        auto_sync.toggled.connect(self._set_auto_sync_pref)
+        file_menu.addAction(auto_sync)
 
         save_filters = QAction("💾 حفظ حالة التشيك بوكس", self)
         save_filters.triggered.connect(self._save_category_checkbox_states)
@@ -3913,6 +4505,151 @@ class MainWindow(QMainWindow):
         run_task(download_and_stage_update, _done, _fail, manifest,
                  status_bar=self.statusBar(),
                  status_message=f"⬇️ جارٍ تنزيل الإصدار v{remote}...")
+
+    # ------------------------------------------------------------------
+    # المزامنة السحابية (Supabase) — v6.6
+    # ------------------------------------------------------------------
+    def _load_auto_sync_pref(self) -> bool:
+        return (self.db_manager.get_setting(SYNC_PREF_KEY, "1") or "1") == "1"
+
+    def _set_auto_sync_pref(self, enabled: bool) -> None:
+        self._auto_sync_pref = bool(enabled)
+        self.db_manager.set_setting(SYNC_PREF_KEY, "1" if enabled else "0")
+
+    def _open_cloud_sync_dialog(self) -> None:
+        dlg = CloudSyncDialog(self)
+        self._sync_dialog_ref = dlg
+        dlg.exec_()
+        if self._sync_dialog_ref is dlg:
+            self._sync_dialog_ref = None
+
+    def _sync_dialog(self) -> Optional[CloudSyncDialog]:
+        """الحوار المفتوح حاليًا فقط (يُتجاهل إن أُغلق)."""
+        dlg = self._sync_dialog_ref
+        if dlg is not None and dlg.isVisible():
+            return dlg
+        return None
+
+    def _clear_sync_session(self) -> None:
+        for key in (SYNC_REFRESH_TOKEN_KEY, SYNC_USER_ID_KEY, SYNC_USER_EMAIL_KEY):
+            try:
+                self.db_manager.set_setting(key, "")
+            except Exception:
+                logger.warning("Failed to clear setting {}", key)
+
+    def _cloud_login_and_sync_worker(self, email: str, password: str) -> Dict[str, Any]:
+        """(خيط خلفية) تسجيل دخول ثم مزامنة كاملة بجلسة الدخول الطازجة."""
+        session = sync_sign_in(email, password)
+        return run_cloud_sync(self.db_manager, session["refresh_token"], session=session)
+
+    def _do_cloud_login(self, dialog: CloudSyncDialog, email: str, password: str) -> None:
+        if self._sync_in_flight:
+            return
+        if not (email or "").strip() or not password:
+            dialog.set_status("⚠️ أدخل البريد الإلكتروني وكلمة المرور أولًا.")
+            return
+        self._sync_in_flight = True
+        dialog.set_busy(True, "🔐 جارٍ تسجيل الدخول والمزامنة الأولى...")
+        run_task(self._cloud_login_and_sync_worker,
+                 lambda res: self._cloud_sync_done(res, True),
+                 lambda err: self._cloud_sync_fail(err, True),
+                 email.strip(), password)
+
+    def _run_cloud_sync(self, dialog: Optional[CloudSyncDialog] = None,
+                        manual: bool = True) -> None:
+        if self._sync_in_flight:
+            if manual:
+                self.statusBar().showMessage("ℹ️ توجد مزامنة قيد التنفيذ بالفعل.", 3000)
+            return
+        if not _sync_configured():
+            if manual:
+                QMessageBox.information(
+                    self, "المزامنة السحابية",
+                    "المزامنة غير مُفعّلة في هذه النسخة.\n\n"
+                    "ضع Project URL و anon key في ثوابت SUPABASE أعلى ملف البرنامج "
+                    "(الشرح في التعليقات فوقها ونافذة المزامنة نفسها).")
+            return
+        refresh_token = self.db_manager.get_setting(SYNC_REFRESH_TOKEN_KEY, "") or ""
+        if not refresh_token:
+            if manual:
+                QMessageBox.information(
+                    self, "المزامنة السحابية",
+                    "لا توجد جلسة مسجّلة على هذا الجهاز.\n\n"
+                    "افتح: ملف → ☁️ المزامنة السحابية وسجّل الدخول مرة واحدة.")
+            else:
+                logger.info("Auto-sync skipped: no saved session")
+            return
+        self._sync_in_flight = True
+        if dialog is not None:
+            dialog.set_busy(True, "🔄 جارٍ المزامنة مع السحابة...")
+        run_task(run_cloud_sync,
+                 lambda res: self._cloud_sync_done(res, manual),
+                 lambda err: self._cloud_sync_fail(err, manual),
+                 self.db_manager, refresh_token)
+
+    def _auto_cloud_sync(self) -> None:
+        """مزامنة صامتة عند الإقلاع — فقط مع جلسة محفوظة وثوابت مضبوطة."""
+        if not self._auto_sync_pref:
+            return
+        if not _sync_configured():
+            return
+        if not (self.db_manager.get_setting(SYNC_REFRESH_TOKEN_KEY, "") or ""):
+            return
+        self._run_cloud_sync(dialog=None, manual=False)
+
+    def _cloud_sync_done(self, result: object, manual: bool) -> None:
+        self._sync_in_flight = False
+        if not isinstance(result, dict):
+            if manual:
+                self.statusBar().showMessage("ℹ️ لم تُعد المزامنة أي نتيجة صالحة.", 4000)
+            return
+        try:
+            self.db_manager.set_setting(SYNC_REFRESH_TOKEN_KEY, result.get("refresh_token") or "")
+            self.db_manager.set_setting(SYNC_USER_ID_KEY, result.get("user_id") or "")
+            if result.get("email"):
+                self.db_manager.set_setting(SYNC_USER_EMAIL_KEY, result["email"])
+            self.db_manager.set_setting(SYNC_LAST_TIME_KEY, result.get("finished_at") or _utc_now_iso())
+        except Exception:
+            logger.opt(exception=True).warning("Failed to persist sync session state")
+        # أظهر الصفوف الواردة من السحابة فورًا في الجدول والإحصاءات
+        try:
+            self.filter_accounts()
+            self._refresh_dashboard_stats()
+        except Exception:
+            logger.opt(exception=True).warning("Post-sync UI refresh failed")
+        msg = (f"☁️ تمت المزامنة: تحديث على الجهاز {result.get('applied_local', 0)}، "
+               f"رفع للسحابة {result.get('pushed', 0)}"
+               + (f"، تجاهُل {result.get('skipped_local', 0)}" if result.get("skipped_local") else "")
+               + ".")
+        self.statusBar().showMessage(msg, 6000 if manual else 4000)
+        dlg = self._sync_dialog()
+        if dlg is not None:
+            dlg.set_busy(False)
+            dlg.refresh_state()
+            dlg.set_status("✅ " + msg)
+
+    def _cloud_sync_fail(self, err: str, manual: bool) -> None:
+        self._sync_in_flight = False
+        # جلسة منتهية؟ امسح الجلسة المحفوظة حتى تظهر شاشة الدخول من جديد
+        if ("سجّل الدخول" in err) or ("انتهت صلاحية الجلسة" in err) or ("غير صحيحة" in err):
+            self._clear_sync_session()
+        self.statusBar().showMessage(f"☁️ المزامنة السحابية: {err}", 8000 if manual else 4000)
+        logger.warning("Cloud sync failed: {}", err)
+        dlg = self._sync_dialog()
+        if dlg is not None:
+            dlg.set_busy(False)
+            dlg.refresh_state()
+            dlg.set_status("❌ " + err)
+
+    def _cloud_logout(self, dialog: Optional[CloudSyncDialog] = None) -> None:
+        """تسجيل الخروج يمسح جلسة هذا الجهاز فقط — البيانات المحلية والسحابية تبقى كما هي."""
+        self._clear_sync_session()
+        self.statusBar().showMessage(
+            "☁️ تم تسجيل الخروج من هذا الجهاز (بياناتك المحلية والسحابية بقيت كما هي).", 5000)
+        if dialog is not None:
+            dialog.refresh_state()
+            dialog.set_status("تم تسجيل الخروج. بياناتك المحلية محفوظة بالكامل، "
+                              "ويمكنك تسجيل الدخول مجددًا في أي وقت.")
 
     def _stop_thread_safely(self, thread_obj: Optional[QThread]) -> None:
         """Stop a helper QThread so it is never destroyed while still running.
