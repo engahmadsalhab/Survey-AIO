@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Account Manager v6.3 — Light Edition
+Account Manager v6.4 — Light Edition
 ====================================
 - Light paper theme: teal accent, white cards, dense dashboard.
 - v6.3 self-update system: checks a hosted update.json manifest on startup
@@ -242,7 +242,7 @@ IS_MACOS: Final[bool] = sys.platform == "darwin"
 IS_LINUX: Final[bool] = sys.platform.startswith("linux")
 
 APP_TITLE: Final[str] = "مدير الحسابات"
-APP_VERSION: Final[str] = "6.3"
+APP_VERSION: Final[str] = "6.4"
 APP_AUTHOR: Final[str] = "Brian Finch"
 
 # All data files live next to this script so the app behaves identically no
@@ -326,7 +326,7 @@ DEFAULT_USER_PASSWORD: Final[str] = os.environ.get("APP_USER_PASSWORD", "123")
 #      versions, and asks التثبيت الآن / لاحقاً. Installing downloads the
 #      new script, compile-checks it (and sha256 when provided), keeps the
 #      current file as <name>.py.bak, then swaps atomically and restarts.
-UPDATE_MANIFEST_URL: Final[str] = "https://example.com/updates/account_manager/update.json"
+UPDATE_MANIFEST_URL: Final[str] = "https://raw.githubusercontent.com/engahmadsalhab/Survey-AIO/main/update.json"
 UPDATE_TIMEOUT_SEC: Final[int] = 20
 UPDATE_DOWNLOAD_TIMEOUT_SEC: Final[float] = 90.0
 UPDATE_PREF_KEY: Final[str] = "pref_auto_update_check"  # "1" = check on startup
