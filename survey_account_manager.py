@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Account Manager v6.4 — Light Edition
+Account Manager v6.5 — Light Edition
 ====================================
 - Light paper theme: teal accent, white cards, dense dashboard.
 - v6.3 self-update system: checks a hosted update.json manifest on startup
@@ -189,6 +189,7 @@ import struct
 import subprocess
 import tempfile
 import threading
+import time
 import urllib.parse
 import webbrowser
 
@@ -242,7 +243,7 @@ IS_MACOS: Final[bool] = sys.platform == "darwin"
 IS_LINUX: Final[bool] = sys.platform.startswith("linux")
 
 APP_TITLE: Final[str] = "مدير الحسابات"
-APP_VERSION: Final[str] = "6.4"
+APP_VERSION: Final[str] = "6.5"
 APP_AUTHOR: Final[str] = "Brian Finch"
 
 # All data files live next to this script so the app behaves identically no
@@ -541,7 +542,7 @@ def fetch_update_manifest(url: str = UPDATE_MANIFEST_URL) -> Dict[str, Any]:
             "UPDATE_MANIFEST_URL غير مضبوط — ضع رابط update.json الخاص بك في أعلى الملف")
     with httpx.Client(timeout=UPDATE_TIMEOUT_SEC, verify=True, follow_redirects=True,
                       headers={"User-Agent": UPDATE_USER_AGENT}) as client:
-        resp = client.get(url)
+        resp = client.get(_cache_busted(url))
         resp.raise_for_status()
         manifest = orjson.loads(resp.content)
     if not isinstance(manifest, dict):
@@ -570,6 +571,33 @@ def validate_python_file(path: Path) -> None:
         py_compile.compile(str(path), cfile=os.path.join(td, "check.pyc"), doraise=True)
 
 
+def extract_staged_version(path: Path) -> str:
+    """Read APP_VERSION out of a downloaded file's text (no import needed).
+
+    Lets the app verify that the file the server actually serves IS the
+    version the manifest advertises, before anything is swapped.
+    """
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    m = re.search(
+        r'^APP_VERSION(?:\s*:\s*Final\[str\])?\s*=\s*["\']([^"\']+)["\']',
+        text, re.M)
+    return m.group(1).strip() if m else ""
+
+
+def _cache_busted(url: str) -> str:
+    """Append a timestamp query so freshly uploaded files are seen at once.
+
+    raw.githubusercontent.com serves through a CDN that caches for a few
+    minutes; without this, a just-pushed update.json or new script can still
+    deliver the previous content and make a release look like a no-op.
+    """
+    sep = "&" if "?" in url else "?"
+    return f"{url}{sep}t={int(time.time() * 1000)}"
+
+
 def download_and_stage_update(
     manifest: Dict[str, Any],
     dest: Path = None,
@@ -586,7 +614,7 @@ def download_and_stage_update(
         with httpx.Client(timeout=UPDATE_DOWNLOAD_TIMEOUT_SEC, verify=True,
                           follow_redirects=True,
                           headers={"User-Agent": UPDATE_USER_AGENT}) as client:
-            with client.stream("GET", url) as resp:
+            with client.stream("GET", _cache_busted(url)) as resp:
                 resp.raise_for_status()
                 with open(tmp, "wb") as fh:
                     for chunk in resp.iter_bytes():
@@ -598,6 +626,17 @@ def download_and_stage_update(
                 raise ValueError(
                     f"فشل التحقق sha256: المتوقع {expected_sha[:12]}… والفعلي {actual[:12]}…")
         validate_python_file(tmp)
+        # Publisher guard: catch a JSON-only release (update.json was bumped
+        # but the .py on the server was never replaced). Without this, the
+        # app would happily "update" to the same old code and then ask for
+        # the update again forever — swapping nothing of value.
+        staged_ver = extract_staged_version(tmp)
+        declared_ver = str(manifest.get("version", "")).strip()
+        if staged_ver and declared_ver and parse_version(staged_ver) < parse_version(declared_ver):
+            raise ValueError(
+                f"الملف المرفوع على الخادم يحمل الإصدار v{staged_ver} بينما ملف التحديث "
+                f"يعلن v{declared_ver} — يجب رفع ملف البرنامج الجديد (.py) إلى المستودع "
+                "وليس تعديل update.json فقط")
         os.replace(tmp, dest)  # atomic on the same volume — never a partial file
     finally:
         try:
@@ -1952,23 +1991,73 @@ class ChangePasswordDialog(QDialog):
 
 
 class AboutDialog(QDialog):
-    def __init__(self, parent: Optional[QWidget] = None) -> None:
+    """About dialog with a prominent installed-version badge.
+
+    The version is the single source of truth for the self-update system,
+    so it is shown as a highlighted badge plus the auto-update-check
+    preference and a one-click "التحقق من التحديثات" button that hands
+    over to the main window's update checker.
+    """
+
+    def __init__(self, parent: Optional[QWidget] = None,
+                 auto_update_enabled: Optional[bool] = None) -> None:
         super().__init__(parent)
         self.setWindowTitle("حول البرنامج")
         self.setLayoutDirection(Qt.RightToLeft)
-        self.resize(400, 200)
+        self.setMinimumSize(430, 280)
         layout = QVBoxLayout(self)
-        lbl = QLabel(
-            f'<h2>مدير الحسابات</h2><p><b>الإصدار:</b> {APP_VERSION}</p>'
+        layout.setSpacing(12)
+
+        title = QLabel('<h2 style="margin:0;">مدير الحسابات</h2>')
+        title.setTextFormat(Qt.RichText)
+        title.setAlignment(ALIGN_RIGHT_ABS)
+        layout.addWidget(title)
+
+        # Prominent version badge — mirrors the APP_VERSION the updater
+        # compares against, so users can verify the installed build at a
+        # glance when an update is announced.
+        version_badge = QLabel(f"الإصدار المثبت: v{APP_VERSION}")
+        version_badge.setObjectName("versionBadge")
+        version_badge.setAlignment(Qt.AlignCenter)
+        layout.addWidget(version_badge)
+
+        auto_line = ""
+        if auto_update_enabled is not None:
+            state = "مفعّل" if auto_update_enabled else "معطّل"
+            auto_line = (f'<p><b>التحقق التلقائي من التحديثات عند بدء التشغيل:</b> '
+                         f'{state}</p>')
+        info = QLabel(
             f'<p><b>المؤلف:</b> {APP_AUTHOR}</p>'
             '<p>تطبيق لإدارة الحسابات والبروكسي والإحصائيات مع بحث فوري وتصدير ونسخ احتياطي.</p>'
+            + auto_line
         )
-        lbl.setWordWrap(True)
-        lbl.setAlignment(ALIGN_RIGHT_ABS)
-        layout.addWidget(lbl)
-        btn = QPushButton("إغلاق")
-        btn.clicked.connect(self.accept)
-        layout.addWidget(btn)
+        info.setTextFormat(Qt.RichText)
+        info.setWordWrap(True)
+        info.setAlignment(ALIGN_RIGHT_ABS)
+        layout.addWidget(info)
+        layout.addStretch(1)
+
+        buttons = QHBoxLayout()
+        check_btn = QPushButton("🔄 التحقق من التحديثات")
+        check_btn.setObjectName("primaryButton")
+        check_btn.setCursor(Qt.PointingHandCursor)
+        check_btn.setToolTip("البحث الآن عن إصدار أحدث")
+        check_btn.clicked.connect(self._trigger_update_check)
+        close_btn = QPushButton("إغلاق")
+        close_btn.setCursor(Qt.PointingHandCursor)
+        close_btn.clicked.connect(self.accept)
+        buttons.addWidget(check_btn)
+        buttons.addStretch(1)
+        buttons.addWidget(close_btn)
+        layout.addLayout(buttons)
+
+    def _trigger_update_check(self) -> None:
+        """Close this dialog and run the main window's update checker so its
+        progress/result is visible on the status bar."""
+        check = getattr(self.parent(), "_check_for_updates", None)
+        self.accept()
+        if callable(check):
+            check(manual=True)
 
 
 class UpdateAvailableDialog(QDialog):
@@ -2990,7 +3079,8 @@ class MainWindow(QMainWindow):
         file_menu.addAction(change_pass)
 
         about = QAction("ℹ️ حول البرنامج", self)
-        about.triggered.connect(lambda: AboutDialog(self).exec_())
+        about.triggered.connect(lambda: AboutDialog(
+            self, auto_update_enabled=self._auto_update_pref).exec_())
         file_menu.addAction(about)
 
         preferences = QAction("⚙️ تفضيلات", self)
@@ -5812,6 +5902,15 @@ QLabel#dialogTitle {{
 }}
 
 /* ===== proxy tab (v6.2): status pill + monospace JSON card ===== */
+QLabel#versionBadge {{
+    color: {_QSS_ACCENT_DEEP};
+    background-color: {_QSS_ACCENT_SOFT};
+    border: 1px solid {_QSS_ACCENT};
+    border-radius: 10px;
+    padding: 8px 18px;
+    font-size: 15px;
+    font-weight: 700;
+}}
 QLabel#proxyStatusLabel {{
     color: {_QSS_WARNING_DARK};
     font-size: 12px;
