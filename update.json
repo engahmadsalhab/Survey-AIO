@@ -9,7 +9,7 @@
     "5) mandatory=true يجعل التحديث إجبارياً (يختفي زر لاحقاً)",
     "ملاحظة: أي حقول تبدأ بشرطة سفلية (_) يتجاهلها البرنامج — لا ترفعها مع update.json إذا أردت"
   ],
-  "version": "6.4",
+  "version": "6.5",
   "url": "https://raw.githubusercontent.com/engahmadsalhab/Survey-AIO/main/survey_account_manager.py",
   "sha256": "",
   "mandatory": false,
