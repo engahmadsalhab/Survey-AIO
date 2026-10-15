@@ -1,9 +1,20 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Account Manager v6.5 — Light Edition
+Account Manager v6.6.1 — Light Edition
 ====================================
 - Light paper theme: teal accent, white cards, dense dashboard.
+- v6.6 Supabase cloud sync: optional per-user sync via a free Supabase
+  project (POST /auth/v1/token → PostgREST with RLS enforced server-side).
+  Local SQLite stays the source of truth — the app works 100% offline and
+  syncs automatically at startup (or via ملف → المزامنة السحابية): pull →
+  last-write-wins merge on updated_at → push, UUID sync_id per row, soft
+  deletes (tombstones), retry/backoff, Arabic error messages for every
+  failure mode (no internet / paused project / expired session / RLS).
+- v6.6.1 fix: CloudSyncDialog crashed on open with
+  "QGridLayout object has no attribute setLayoutDirection" — direction is
+  inherited from the login QGroupBox instead (dialogs are now covered by a
+  runtime offscreen smoke test).
 - v6.3 self-update system: checks a hosted update.json manifest on startup
   (silent, background) or manually via ملف → التحقق من التحديثات, offers an
   RTL "التثبيت الآن / لاحقاً" dialog, downloads + compile-checks the new
@@ -244,7 +255,7 @@ IS_MACOS: Final[bool] = sys.platform == "darwin"
 IS_LINUX: Final[bool] = sys.platform.startswith("linux")
 
 APP_TITLE: Final[str] = "مدير الحسابات"
-APP_VERSION: Final[str] = "6.6"
+APP_VERSION: Final[str] = "6.6.1"
 APP_AUTHOR: Final[str] = "Brian Finch"
 
 # All data files live next to this script so the app behaves identically no
@@ -2575,7 +2586,8 @@ class CloudSyncDialog(QDialog):
         self.login_box = QGroupBox("تسجيل الدخول")
         self.login_box.setLayoutDirection(Qt.RightToLeft)
         form = QGridLayout(self.login_box)
-        form.setLayoutDirection(Qt.RightToLeft)
+        # ملاحظة: الاتجاه يُورَّث من login_box (widget) — QGridLayout نفسه
+        # لا يملك setLayoutDirection ونداؤها يرفع AttributeError.
         self.email_input = QLineEdit()
         self.email_input.setPlaceholderText("البريد الإلكتروني للحساب السحابي")
         self.password_input = QLineEdit()
