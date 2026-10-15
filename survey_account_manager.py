@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Account Manager v6.6.1 — Light Edition
+Account Manager v6.7 — Light Edition
 ====================================
 - Light paper theme: teal accent, white cards, dense dashboard.
 - v6.6 Supabase cloud sync: optional per-user sync via a free Supabase
@@ -15,6 +15,12 @@ Account Manager v6.6.1 — Light Edition
   "QGridLayout object has no attribute setLayoutDirection" — direction is
   inherited from the login QGroupBox instead (dialogs are now covered by a
   runtime offscreen smoke test).
+- v6.7 fix: the automatic restart after installing an update launched the
+  new interpreter WITHOUT the script path (os.execl dropped sys.argv[0]),
+  so the app died with "can't open file ..." instead of restarting. The
+  relaunch is now an explicit [python, script] command with absolute
+  paths; if it ever fails the user gets an Arabic message instead of a
+  dead console — the update itself is already applied at that point.
 - v6.3 self-update system: checks a hosted update.json manifest on startup
   (silent, background) or manually via ملف → التحقق من التحديثات, offers an
   RTL "التثبيت الآن / لاحقاً" dialog, downloads + compile-checks the new
@@ -255,7 +261,7 @@ IS_MACOS: Final[bool] = sys.platform == "darwin"
 IS_LINUX: Final[bool] = sys.platform.startswith("linux")
 
 APP_TITLE: Final[str] = "مدير الحسابات"
-APP_VERSION: Final[str] = "6.6.1"
+APP_VERSION: Final[str] = "6.7"
 APP_AUTHOR: Final[str] = "Brian Finch"
 
 # All data files live next to this script so the app behaves identically no
@@ -720,12 +726,23 @@ def apply_self_update(staged: Path = None, target: Path = None) -> Path:
     return backup
 
 
-def restart_application() -> None:
-    """Replace this process with a fresh interpreter running the updated code.
+def restart_application() -> bool:
+    """Spawn a fresh interpreter running the updated code.
 
-    os.execl never returns — the current process image is replaced. Data files
-    (accounts.db, proxy_config.json, preferences) live beside the script and
-    are untouched by the update, so the new version picks up where we left off.
+    Returns True once the new process is launched — the caller then closes
+    this instance through the normal shutdown path. Data files
+    (accounts.db, proxy_config.json, preferences) live beside the script
+    and are untouched by the update, so the new version picks up where we
+    left off.
+
+    v6.7 fix: the old implementation passed ``*sys.argv[1:]`` to os.execl
+    and silently dropped ``sys.argv[0]`` — the script path itself — so the
+    fresh interpreter promoted the first extra launch argument (or nothing
+    at all) to "script" position and died with "can't open file ..." instead
+    of starting the updated app. The command is now always built
+    explicitly as [python_exe, script_path] with both resolved to
+    absolute paths, and any launch failure is reported to the caller
+    instead of killing the current process.
     """
     logger.info("Restarting application to apply the update...")
     try:
@@ -733,7 +750,29 @@ def restart_application() -> None:
         sys.stderr.flush()
     except Exception:
         pass
-    os.execl(sys.executable, sys.executable, *sys.argv[1:])
+
+    import shutil as _shutil
+
+    python_exe = str(sys.executable or "").strip() or "python"
+    if not os.path.isabs(python_exe):
+        # Defensive: some wrappers launch Python through a relative path.
+        python_exe = _shutil.which(python_exe) or _shutil.which("python") or python_exe
+
+    script = ""
+    if sys.argv and sys.argv[0]:
+        script = os.path.abspath(sys.argv[0])
+    if not script or not os.path.isfile(script):
+        # argv[0] can point somewhere odd when the app is launched through a
+        # wrapper — this real source file is always a valid fallback.
+        script = os.path.abspath(__file__)
+
+    args = [python_exe, script] + [str(a) for a in sys.argv[1:]]
+    try:
+        subprocess.Popen(args, cwd=os.path.dirname(script))
+        return True
+    except Exception as exc:
+        logger.error("تعذّر بدء النسخة الجديدة بعد التحديث: {}", exc)
+        return False
 
 
 def find_firefox_executable() -> Optional[str]:
@@ -988,9 +1027,21 @@ def _classify_http_error(status: int, body: str) -> SyncError:
             "الاستخدام ولا تضيع البيانات.\nافتح لوحة supabase.com واضغط Restore على "
             "المشروع ثم أعد المحاولة. يعمل البرنامج محليًا بشكل طبيعي في هذه الأثناء.")
     if status == 42501 or "row-level security" in body.lower():
+        # رفض RLS حقيقي من الخادم. عندما تكون RLS مفعّلة دون سياسات ينجح السحب
+        # (يُرجع 0 صفوف بصمت) ويفشل الرفع بهذا الخطأ — لذا نُظهر مرجع المشروع
+        # والتفاصيل الخام من الخادم حتى يكون التشخيص فوريًا دون تخمين.
+        try:
+            ref = str(SUPABASE_URL).split("//")[-1].split(".")[0]
+        except Exception:
+            ref = ""
+        where = f" (مشروع Supabase: {ref})" if ref else ""
         return SyncError(
-            "رفضت قاعدة البيانات العملية بسبب سياسات العزل (RLS) — تأكد أن هذا "
-            "الحساب مالك هذه الصفوف وأنك نفّذت supabase_setup.sql كاملًا.")
+            "رفضت قاعدة البيانات العملية بسبب سياسات العزل (RLS)." + where +
+            "\nالسبب الأكثر شيوعًا: سياسات supabase_setup.sql غير منفّذة على جدول "
+            "accounts في هذا المشروع، أو نُفّذ الملف في مشروع مختلف عن المشروع "
+            "المكتوب في إعدادات البرنامج.\nالحل: أعد تنفيذ supabase_setup.sql كاملًا "
+            "في المشروع الصحيح (SQL Editor ← RUN) ثم أعد المزامنة.\n"
+            "تفاصيل الخادم: " + body[:160])
     return SyncError(f"خطأ من الخادم السحابي (HTTP {status}): {body[:180]}")
 
 
@@ -4497,7 +4548,19 @@ class MainWindow(QMainWindow):
                         self, "فشل التثبيت",
                         f"تعذّر استبدال ملف البرنامج:\n{exc}\n\nلم يتم تعديل أي ملف.")
                     return
-                restart_application()
+                if restart_application():
+                    # النسخة الجديدة تعمل الآن — نغلق هذه النسخة بنفس مسار
+                    # الإغلاق الطبيعي (يوقف الخيوط ويغلق قاعدة البيانات).
+                    self.close()
+                else:
+                    # التثبيت نجح لكن التشغيل التلقائي فشل — لا خسارة: يكفي
+                    # أن يشغّل المستخدم البرنامج يدوياً مرة أخرى.
+                    QMessageBox.information(
+                        self, "تم تثبيت التحديث",
+                        "تم تثبيت الإصدار الجديد بنجاح ✅\n\n"
+                        "تعذّر بدء التشغيل التلقائي — الرجاء إغلاق البرنامج "
+                        "وتشغيله مرة أخرى يدوياً لتطبيق التحديث.")
+                    self.close()
             else:
                 # Declined restart: discard the staged file so state stays
                 # trivial; the update is simply offered again on next check.
