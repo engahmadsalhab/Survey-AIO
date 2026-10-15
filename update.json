@@ -11,7 +11,7 @@
   ],
   "version": "6.6",
   "url": "https://raw.githubusercontent.com/engahmadsalhab/Survey-AIO/main/survey_account_manager.py",
-  "sha256": "1b79df58e0995306c8464616de6f4cf3c4509c59c8e1ea36a2671db54dab3245",
+  "sha256": "",
   "mandatory": false,
   "notes": "v6.6: مزامنة سحابية عبر Supabase — حساباتك على كل أجهزتك مع عمل كامل بدون إنترنت، عزل صارم يمنع أي مستخدم من رؤية بيانات غيره (RLS)، منع التكرار والتعارض بالهوية الفريدة والأحدث زمنياً يفوز، وحذف ناعم آمن. التفعيل يحتاج خطوة واحدة من المشرف (شاهد ملف SUPABASE_SETUP_AR.md)."
 }
