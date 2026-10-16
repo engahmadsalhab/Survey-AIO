@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Account Manager v6.7 — Light Edition
+Account Manager v6.8 — Light Edition
 ====================================
 - Light paper theme: teal accent, white cards, dense dashboard.
 - v6.6 Supabase cloud sync: optional per-user sync via a free Supabase
@@ -21,6 +21,14 @@ Account Manager v6.7 — Light Edition
   relaunch is now an explicit [python, script] command with absolute
   paths; if it ever fails the user gets an Arabic message instead of a
   dead console — the update itself is already applied at that point.
+- v6.8 fix: push failed with 42501 "new row violates row-level security
+  policy (USING expression)" when the cloud already held rows with the same
+  sync_id pushed earlier under a DIFFERENT Supabase account — per-user
+  isolation policies (auth.uid() = user_id) forbid updating another
+  account's rows. The dataset is a shared team set, so supabase_setup.sql
+  now ships team-shared RLS policies (any authenticated user = full access,
+  anonymous = nothing), and the RLS error classifier recognizes the
+  "(USING expression)" signature with a targeted Arabic fix message.
 - v6.3 self-update system: checks a hosted update.json manifest on startup
   (silent, background) or manually via ملف → التحقق من التحديثات, offers an
   RTL "التثبيت الآن / لاحقاً" dialog, downloads + compile-checks the new
@@ -261,7 +269,7 @@ IS_MACOS: Final[bool] = sys.platform == "darwin"
 IS_LINUX: Final[bool] = sys.platform.startswith("linux")
 
 APP_TITLE: Final[str] = "مدير الحسابات"
-APP_VERSION: Final[str] = "6.7"
+APP_VERSION: Final[str] = "6.8"
 APP_AUTHOR: Final[str] = "Brian Finch"
 
 # All data files live next to this script so the app behaves identically no
@@ -358,15 +366,17 @@ UPDATE_USER_AGENT: Final[str] = f"AccountManager/{APP_VERSION} (self-update)"
 #
 # كيف تُفعّلها (مرة واحدة):
 #   1) أنشئ مشروعًا مجانيًا على supabase.com ثم نفّذ ملف supabase_setup.sql
-#      من محرر SQL داخل لوحة المشروع (ينشئ الجدول + سياسات العزل RLS).
+#      من محرر SQL داخل لوحة المشروع (ينشئ الجدول + سياسات RLS لمشاركة
+#      الفريق: المسجّلون كامل الصلاحية والمجهولون لا شيء).
 #   2) أنشئ مستخدمًا لكل شخص من: Authentication → Users → Add user
 #      (فعّل Auto Confirm حتى يستطيع تسجيل الدخول فورًا).
 #   3) الصق قيم Project URL و anon key من: Settings → API في الثابتين أدناه.
 #   4) ارفع الملف إلى المستودع كأي تحديث. كل مستخدم يدخل بريده وكلمة المرور
 #      من داخل البرنامج: ملف → المزامنة السحابية.
 #
-# ⚠️ استخدم anon key فقط — لا تضع service_role key هنا أبدًا، فالعزل يعتمد
-#    على سياسات RLS التي تفرضها قاعدة البيانات نفسها على كل مستخدم.
+# ⚠️ استخدم anon key فقط — لا تضع service_role key هنا أبدًا، فالحماية تعتمد
+#    على سياسات RLS التي تفرضها قاعدة البيانات نفسها: البيانات مشتركة بين
+#    مستخدمي الفريق المسجّلين فقط، ومن بلا حساب سحابي لا يرى شيئًا.
 # ----------------------------------------------------------------------------
 SUPABASE_URL: Final[str] = "https://wqaqndarwisvpcuiuotp.supabase.co"            # مثال: https://xxxxxxxx.supabase.co
 SUPABASE_ANON_KEY: Final[str] = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6IndxYXFuZGFyd2lzdnBjdWl1b3RwIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTIwNzY4MTQsImV4cCI6MjEwNzY1MjgxNH0.PqghxICWruk9O1KU7aTaxqicqXr1yklECPTRP-cvvxo"       # مفتاح anon العام (آمن مع RLS)
@@ -1035,13 +1045,27 @@ def _classify_http_error(status: int, body: str) -> SyncError:
         except Exception:
             ref = ""
         where = f" (مشروع Supabase: {ref})" if ref else ""
+        detail = "تفاصيل الخادم: " + body[:160]
+        if "using expression" in body.lower():
+            # توقيع دقيق: 42501 "(USING expression)" يظهر عند الرفع (upsert
+            # on_conflict) على صف موجود في السحابة فشل في فحص USING لسياسة
+            # التحديث — أي أن الصف ملك لحساب Supabase آخر (سبقت مزامنته
+            # بحساب مختلف) ولا يملك الحساب الحالي حق تحديث صف الغير.
+            return SyncError(
+                "رفضت قاعدة البيانات الرفع بسبب سياسات العزل (RLS) — يوجد في "
+                "السحابة صف بنفس المعرّف ملك لحساب Supabase آخر." + where +
+                "\nالسبب: جدول accounts معزول لكل مستخدم على حدة، وصفوفك هذه "
+                "سبقت مزامنتها بحساب مختلف، فلا يملك الحساب الحالي حق تحديثها."
+                "\nالحل: نفّذ نسخة supabase_setup.sql المحدّثة (سياسات مشاركة "
+                "الفريق) في هذا المشروع نفسه (SQL Editor ← RUN) ثم أعد "
+                "المزامنة — الملف آمن ولا يحذف أي بيانات.\n" + detail)
         return SyncError(
             "رفضت قاعدة البيانات العملية بسبب سياسات العزل (RLS)." + where +
             "\nالسبب الأكثر شيوعًا: سياسات supabase_setup.sql غير منفّذة على جدول "
             "accounts في هذا المشروع، أو نُفّذ الملف في مشروع مختلف عن المشروع "
             "المكتوب في إعدادات البرنامج.\nالحل: أعد تنفيذ supabase_setup.sql كاملًا "
             "في المشروع الصحيح (SQL Editor ← RUN) ثم أعد المزامنة.\n"
-            "تفاصيل الخادم: " + body[:160])
+            + detail)
     return SyncError(f"خطأ من الخادم السحابي (HTTP {status}): {body[:180]}")
 
 
@@ -2627,8 +2651,9 @@ class CloudSyncDialog(QDialog):
             "4) انسخ Project URL و anon key إلى الثابتين SUPABASE_URL و "
             "SUPABASE_ANON_KEY أعلى ملف البرنامج ثم أعد توزيعه كتحديث\n\n"
             "بعد التفعيل يكفي أن يسجّل كل مستخدم بريده وكلمة مروره هنا، وتعمل "
-            "المزامنة تلقائيًا عند كل إقلاع. كل مستخدم يرى بياناته هو فقط "
-            "(عزل مفرض من قاعدة البيانات نفسها عبر RLS).")
+            "المزامنة تلقائيًا عند كل إقلاع. بيانات الفريق مشتركة بين جميع "
+            "الحسابات المسجّلة في المشروع (الدمج يحسم التعارضات بأحدث تعديل)، "
+            "ومن بلا حساب سحابي لا يرى شيئًا بفضل RLS.")
         self.setup_label.setWordWrap(True)
         self.setup_label.setVisible(False)
         layout.addWidget(self.setup_label)
